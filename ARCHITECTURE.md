@@ -2,7 +2,40 @@
 
 Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
 
-**Trạng thái: thiết kế mục tiêu, chưa phải mô tả một workflow đã triển khai.**
+**Trạng thái: đã triển khai (rules `l3a-rules-v2`).** Module tương ứng:
+`a2a.py` (message contract), `coordinator.py` (intake, routing, budget, handoff,
+validate result, candidate, remediation), `agents.py` (order/payment/shipment),
+`policy.py`, `verifier.py`, `ledger.py` (Evidence Ledger + allowlist tool),
+`mcp_gateway.py` (MCP streamable HTTP có deadline/retry), `competition.py`
+(mở run), `workflow.py`.
+
+Phát hiện từ MCP evidence thật (quyết định rules v2):
+
+- MCP chỉ trả evidence khi team có run đang mở; `day09 run` gọi `POST /api/v2/runs`
+  (giống workspace) trước khi chạy, và ref chỉ hợp lệ trong run đó.
+- Evidence của một order có thể lẫn dòng thuộc cửa sổ thời gian khác. Specialist neo
+  theo `order_purchase_timestamp`: capture trong [-1h, +1d], item có
+  `shipping_limit_date` trong [0, +6d], refund trong [0, +25d], event giao trễ trùng
+  ngày giao thực tế (±1d). Dòng trùng lặp hoàn toàn được loại.
+- Nhãn chọn theo thứ tự: canceled/unavailable có tiền đã capture → refund failed →
+  refund pending → `reconciliation_mismatch` → capture trùng → giao trễ (theo `actor`)
+  → split khớp tổng đơn → `unsupported_claim`. `case_status`, action và loại bên chịu
+  trách nhiệm lấy từ `get_policy` (EC_POLICY_V1); `party_id` seller lấy từ item.
+- Case không thu được evidence nào bị đánh `failed` (không ghi output), để batch
+  không bao giờ được đóng gói với toàn output rỗng evidence.
+
+Điểm lệch có chủ đích so với đặc tả gốc bên dưới:
+
+- Retry hạ tầng: tối đa 3 lần retry (backoff 1s/2s/4s) cho lỗi tạm thời, vì mạng
+  thi đấu thực tế chập chờn; vẫn nằm trong deadline task và không retry 4xx/`isError`.
+- `PolicyTaskPayload` có thêm `policy_version` và `intent_hints` (cần cho `get_policy`).
+- Mỗi `AgentResult` được Coordinator chấp nhận sinh một event `handoff`
+  (agent → coordinator); handoff request giữa domain sinh `handoff` + `task_assigned`.
+- Transport tự viết thay cho `mcp` client: server trả `202` chunked cho notification
+  mà không đóng body, khiến client cũ treo khi đóng session.
+- `get_customer_history` (domain `customer`) chưa có owner nên không được gọi.
+- Tool lỗi (`isError`) là coverage gap; khi không có evidence nào, kết luận là
+  `insufficient_evidence` / `needs_investigation` và không có evidence ref.
 Public contracts trong `contracts/` là chuẩn của cuộc thi và không được sửa để phù
 hợp implementation. Các budget, timeout, interface nội bộ và quy tắc kiểm tra bổ sung
 trong tài liệu là quyết định của nhóm, không phải yêu cầu đã được scorer xác nhận.
