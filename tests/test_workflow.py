@@ -23,7 +23,6 @@ ORDER = "e2a03ccf5ea816036608b2d8c3ab8e60"
 DOMAINS = {
     "get_order": "order",
     "get_order_items": "item",
-    "get_order_payments": "payment",
     "get_payment_timeline": "payment",
     "get_refund_timeline": "refund",
     "get_shipment_summary": "shipment",
@@ -79,16 +78,58 @@ def run(gateway: FakeGateway, tmp_path: Path, topic: str = "canceled_order_paid"
     return output, events
 
 
+P = "2017-12-20T09:00:00-03:00"
+
+
+def capture(at: str, amount: str) -> dict[str, str]:
+    return {"event_at": at, "event_type": "captured", "amount_brl": amount, "status": "confirmed"}
+
+
 CANCELED = {
-    "get_order": {"order_id": ORDER, "order_status": "canceled", "customer_unique_id": "cu1"},
+    "get_order": {
+        "order_id": ORDER,
+        "order_status": "canceled",
+        "order_purchase_timestamp": P,
+        "order_delivered_customer_date": None,
+        "order_estimated_delivery_date": "2017-12-30T09:00:00-03:00",
+    },
     "get_order_items": [
-        {"order_item_id": 1, "seller_id": "s1", "price": 100.0, "freight_value": 20.5}
+        {
+            "order_id": ORDER,
+            "order_item_id": "item-1",
+            "seller_id": "seller-1",
+            "shipping_limit_date": "2017-12-23T09:00:00-03:00",
+            "price": "79.00",
+            "freight_value": "10.00",
+        },
+        # row from another purchase window: must be ignored
+        {
+            "order_id": ORDER,
+            "order_item_id": "item-1",
+            "seller_id": "seller-1",
+            "shipping_limit_date": "2018-05-14T09:00:00-03:00",
+            "price": "79.00",
+            "freight_value": "18.00",
+        },
     ],
-    "get_order_payments": [
-        {"payment_sequential": 1, "payment_type": "credit_card", "payment_value": 120.5}
-    ],
-    "get_refund_timeline": {"events": []},
-    "get_policy": {"policy_version": "EC_POLICY_V1"},
+    "get_payment_timeline": {
+        "order_id": ORDER,
+        "payments": [
+            {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "79.00"}
+        ],
+        "events": [
+            capture("2017-12-20T10:00:00-03:00", "79.00"),
+            capture("2018-05-11T10:00:00-03:00", "18.00"),
+        ],
+    },
+    "get_shipment_summary": {
+        "order_status": "canceled",
+        "delivered_customer_at": None,
+        "estimated_delivery_at": "2017-12-30T09:00:00-03:00",
+        "shipping_limits": [],
+        "events": [],
+    },
+    "get_policy": {"policy_version": "EC_POLICY_V1", "rules": {}},
 }
 
 
@@ -105,7 +146,8 @@ def test_canceled_paid_order_gets_full_refund(tmp_path: Path) -> None:
     CONTRACTS.validate_output(output, "output")
     assert output["assessment"]["primary_issue"] == "canceled_order_paid"
     assert output["assessment"]["case_status"] == "action_required"
-    assert output["financial_resolution"]["recommended_refund_brl"] == 120.5
+    assert output["financial_resolution"]["recommended_refund_brl"] == 79.0
+    assert output["affected_entities"]["seller_ids"] == ["seller-1"]
     assert all(call[1]["case_id"] == "L3A_CASE_001" for call in gateway.calls)
     consumed = {
         r for e in events if e["event_type"] == "tool_result_consumed" for r in e["evidence_refs"]
@@ -123,25 +165,31 @@ def test_canceled_paid_order_gets_full_refund(tmp_path: Path) -> None:
     assert "case_finalized" not in types  # the CLI emits it after writing the output
 
 
-def test_all_tools_failing_yields_insufficient_evidence_without_refs(tmp_path: Path) -> None:
-    output, _ = run(FakeGateway({}), tmp_path)
-    CONTRACTS.validate_output(output, "output")
-    assert output["assessment"]["primary_issue"] == "insufficient_evidence"
-    assert output["assessment"]["case_status"] == "needs_investigation"
-    assert output["evidence_refs"] == []
+def test_all_tools_failing_fails_the_case_instead_of_writing_output(tmp_path: Path) -> None:
+    with pytest.raises(CaseFailedError, match="NO_EVIDENCE_COLLECTED"):
+        run(FakeGateway({}), tmp_path)
 
 
 def test_late_delivery_blames_seller_when_handoff_was_late(tmp_path: Path) -> None:
     data = dict(CANCELED)
-    data["get_order"] = {"order_status": "delivered"}
+    data["get_order"] = {**CANCELED["get_order"], "order_status": "delivered"}
+    data["get_payment_timeline"] = {"events": [capture("2017-12-20T10:00:00-03:00", "18.00")]}
     data["get_shipment_summary"] = {
-        "order_delivered_customer_date": "2018-02-20 10:00:00",
-        "order_estimated_delivery_date": "2018-02-10 00:00:00",
-        "order_delivered_carrier_date": "2018-02-09 10:00:00",
-        "shipping_limit_date": "2018-02-05 00:00:00",
+        "order_status": "delivered",
+        "delivered_customer_at": "2018-01-05T09:00:00-03:00",
+        "estimated_delivery_at": "2018-01-01T09:00:00-03:00",
+        "events": [
+            {
+                "event_at": "2018-01-05T09:00:00-03:00",
+                "event_type": "delivered_late",
+                "actor": "seller",
+                "status": "confirmed",
+            },
+        ],
     }
     output, _ = run(FakeGateway(data), tmp_path, "late_delivery_seller")
     assert output["assessment"]["primary_issue"] == "late_delivery_seller"
+    assert output["financial_resolution"]["recommended_refund_brl"] == 10.0  # freight
     assert {p["party_type"] for p in output["root_cause_analysis"]["responsible_parties"]} == {
         "seller"
     }

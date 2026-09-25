@@ -116,8 +116,10 @@ class VerifierAgent:
             hard.append("REFUND_TOTAL_MISMATCH")
         if recommended > 0 and (status != "action_required" or not candidate["resolution_actions"]):
             hard.append("REFUND_WITHOUT_ACTION")
-        if status == "no_action" and (recommended > 0 or candidate["resolution_actions"]):
-            hard.append("NO_ACTION_WITH_ACTIONS")
+        if status == "no_action" and (
+            recommended > 0 or any("refund" in a for a in candidate["resolution_actions"])
+        ):
+            hard.append("NO_ACTION_WITH_REFUND")
         if len({(line["reason_code"], line["entity_id"]) for line in lines}) != len(lines):
             hard.append("DUPLICATE_REFUND_LINE")
 

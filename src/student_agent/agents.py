@@ -2,17 +2,19 @@
 
 Each agent only calls the MCP tools of its own domain (``ledger.TOOL_MAPPING``), turns
 validated evidence into findings that carry the supporting ``evidence_ref`` and emits
-``tool_result_consumed`` for evidence it actually used. A failed or missing tool call is
-a coverage gap, never negative evidence.
+``tool_result_consumed`` for evidence it actually used. A failed tool call is a
+coverage gap, never negative evidence.
 
-MCP ``data`` payloads are read defensively (Olist-style field names, several aliases)
-because their business structure is not part of the public contract.
+Evidence rows for one order can include rows from another time window (a different
+purchase cluster). Specialists anchor on the order's purchase timestamp and keep only
+rows inside that order's own timeline; excluded rows are reported as warnings.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -33,47 +35,41 @@ from .a2a import (
 from .ledger import EvidenceRecord, thaw
 from .mcp_gateway import GatewayError, GatewayFatalError
 
-LIST_KEYS = (
-    "rows",
-    "items",
-    "order_items",
-    "payments",
-    "events",
-    "timeline",
-    "refunds",
-    "sellers",
-    "products",
-    "records",
-    "data",
-    "history",
-    "orders",
-    "shipments",
-)
+# Relevance windows relative to the order purchase timestamp (rules l3a-rules-v2).
+CAPTURE_WINDOW = (timedelta(hours=-1), timedelta(days=1))
+ITEM_LIMIT_WINDOW = (timedelta(0), timedelta(days=6))
+REFUND_WINDOW = (timedelta(0), timedelta(days=25))
+PAYMENT_EVENT_WINDOW = (timedelta(hours=-1), timedelta(days=2))
+DELIVERY_EVENT_TOLERANCE = timedelta(days=1)
 
 
 # ----------------------------------------------------------------- data helpers
 def rows(data: Any) -> list[dict[str, Any]]:
-    """Return the list of row objects inside an evidence ``data`` payload."""
+    """Return the row objects of an evidence ``data`` payload (list or single object)."""
     value = thaw(data)
     if isinstance(value, list):
         return [row for row in value if isinstance(row, dict)]
     if isinstance(value, dict):
-        for key in LIST_KEYS:
-            inner = value.get(key)
-            if isinstance(inner, list) and all(isinstance(row, dict) for row in inner):
-                return inner
         return [value]
     return []
 
 
-def nested_rows(data: Any, *keys: str) -> list[dict[str, Any]]:
+def nested_rows(data: Any, key: str) -> list[dict[str, Any]]:
     value = thaw(data)
-    if isinstance(value, dict):
-        for key in keys:
-            inner = value.get(key)
-            if isinstance(inner, list):
-                return [row for row in inner if isinstance(row, dict)]
+    if isinstance(value, dict) and isinstance(value.get(key), list):
+        return [row for row in value[key] if isinstance(row, dict)]
     return []
+
+
+def distinct(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop rows that are exact copies (same fields and timestamps) of an earlier row."""
+    seen, result = set(), []
+    for item in items:
+        key = json.dumps(item, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
 
 
 def get(row: Mapping[str, Any] | None, *names: str) -> Any:
@@ -86,7 +82,7 @@ def get(row: Mapping[str, Any] | None, *names: str) -> Any:
 
 
 def money(value: Any) -> Decimal | None:
-    if value is None or isinstance(value, bool):
+    if value is None or isinstance(value, bool) or value == "":
         return None
     try:
         return Decimal(str(value)).quantize(Decimal("0.01"))
@@ -97,18 +93,32 @@ def money(value: Any) -> Decimal | None:
 def when(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
-    text = value.strip().replace("Z", "+00:00")
-    for candidate in (text, text.replace(" ", "T")):
-        try:
-            parsed = datetime.fromisoformat(candidate)
-            return parsed.replace(tzinfo=None)
-        except ValueError:
-            continue
-    return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def within(
+    moment: datetime | None, anchor: datetime | None, window: tuple[timedelta, timedelta]
+) -> bool:
+    if moment is None or anchor is None:
+        return anchor is None  # without an anchor nothing can be excluded
+    try:
+        return anchor + window[0] <= moment <= anchor + window[1]
+    except TypeError:  # naive vs aware
+        return True
 
 
 def lower(value: Any) -> str:
     return str(value).strip().lower() if value is not None else ""
+
+
+def purchase_anchor(findings: Iterable[Finding]) -> datetime | None:
+    for finding in findings:
+        if finding.finding_code == "ORDER_STATUS" and isinstance(finding.value, dict):
+            return when(finding.value.get("purchased_at"))
+    return None
 
 
 class _Specialist:
@@ -186,10 +196,10 @@ class _Specialist:
         )
 
     @staticmethod
-    def _order_ids(task: AgentTask) -> tuple[str, ...]:
+    def _payload(task: AgentTask) -> DomainTaskPayload:
         payload = task.payload
         assert isinstance(payload, DomainTaskPayload)
-        return payload.entity_ids.order_ids
+        return payload
 
 
 # ---------------------------------------------------------------- order agent
@@ -202,103 +212,86 @@ class OrderAgent(_Specialist):
         gaps: list[str] = []
         used: list[EvidenceRecord] = []
         entities = EntityIds()
-        for order_id in self._order_ids(task):
+        for order_id in self._payload(task).entity_ids.order_ids:
             order = await self._fetch(context, gaps, "get_order", order_id=order_id)
-            if order is not None:
-                row = rows(order.data)[0] if rows(order.data) else {}
-                status = lower(get(row, "order_status", "status"))
-                if status or row:
+            anchor = None
+            if order is not None and rows(order.data):
+                row = rows(order.data)[0]
+                if get(row, "order_id") not in (None, order_id):
+                    gaps.append("get_order:ORDER_ID_MISMATCH")
+                else:
+                    anchor = when(get(row, "order_purchase_timestamp"))
                     used.append(order)
-                    entities = entities.union(EntityIds(order_ids=(order_id,)))
+                    order_entities = EntityIds(order_ids=(order_id,))
+                    entities = entities.union(order_entities)
                     findings.append(
                         self._finding(
                             task,
                             "ORDER_STATUS",
-                            status or None,
-                            [order],
-                            EntityIds(order_ids=(order_id,)),
-                        )
-                    )
-                    dates = {
-                        key: get(row, key)
-                        for key in (
-                            "order_purchase_timestamp",
-                            "order_approved_at",
-                            "order_delivered_carrier_date",
-                            "order_delivered_customer_date",
-                            "order_estimated_delivery_date",
-                        )
-                        if get(row, key)
-                    }
-                    if dates:
-                        findings.append(
-                            self._finding(
-                                task,
-                                "ORDER_TIMELINE",
-                                dates,
-                                [order],
-                                EntityIds(order_ids=(order_id,)),
-                            )
-                        )
-                    customer = get(row, "customer_unique_id", "customer_id")
-                    if customer:
-                        findings.append(
-                            self._finding(task, "ORDER_CUSTOMER", str(customer), [order])
-                        )
-            items = await self._fetch(context, gaps, "get_order_items", order_id=order_id)
-            if items is not None:
-                item_rows = rows(items.data)
-                total_price = Decimal("0")
-                total_freight = Decimal("0")
-                item_ids: list[str] = []
-                seller_ids: list[str] = []
-                lines = []
-                for row in item_rows:
-                    price = money(get(row, "price", "item_price")) or Decimal("0")
-                    freight = money(get(row, "freight_value", "freight")) or Decimal("0")
-                    total_price += price
-                    total_freight += freight
-                    item_id = get(row, "item_id", "order_item_key", "order_item_uid")
-                    if item_id is None and get(row, "order_item_id") is not None:
-                        item_id = get(row, "order_item_id")
-                    seller = get(row, "seller_id")
-                    if item_id is not None:
-                        item_ids.append(str(item_id))
-                    if seller:
-                        seller_ids.append(str(seller))
-                    lines.append(
-                        {
-                            "item_id": None if item_id is None else str(item_id),
-                            "seller_id": seller,
-                            "price": str(price),
-                            "freight": str(freight),
-                            "status": lower(get(row, "item_status", "status", "availability"))
-                            or None,
-                            "shipping_limit_date": get(row, "shipping_limit_date"),
-                        }
-                    )
-                if item_rows:
-                    used.append(items)
-                    item_entities = EntityIds(
-                        order_ids=(order_id,),
-                        item_ids=tuple(item_ids),
-                        seller_ids=tuple(seller_ids),
-                    )
-                    entities = entities.union(item_entities)
-                    findings.append(
-                        self._finding(
-                            task,
-                            "ORDER_ITEMS",
                             {
-                                "lines": lines,
-                                "items_total": str(total_price),
-                                "freight_total": str(total_freight),
-                                "order_total": str(total_price + total_freight),
+                                "order_id": order_id,
+                                "status": lower(get(row, "order_status")) or None,
+                                "purchased_at": get(row, "order_purchase_timestamp"),
+                                "approved_at": get(row, "order_approved_at"),
+                                "delivered_carrier_at": get(row, "order_delivered_carrier_date"),
+                                "delivered_customer_at": get(row, "order_delivered_customer_date"),
+                                "estimated_delivery_at": get(row, "order_estimated_delivery_date"),
                             },
-                            [items],
-                            item_entities,
+                            [order],
+                            order_entities,
                         )
                     )
+            items = await self._fetch(context, gaps, "get_order_items", order_id=order_id)
+            if items is None:
+                continue
+            kept, dropped = [], 0
+            for row in distinct(rows(items.data)):
+                limit = when(get(row, "shipping_limit_date"))
+                if within(limit, anchor, ITEM_LIMIT_WINDOW):
+                    kept.append(row)
+                else:
+                    dropped += 1
+            if dropped:
+                gaps.append(f"get_order_items:{dropped}_ROWS_OUTSIDE_ORDER_TIMELINE")
+            if not kept:
+                continue
+            lines = []
+            for row in kept:
+                price = money(get(row, "price")) or Decimal("0")
+                freight = money(get(row, "freight_value")) or Decimal("0")
+                lines.append(
+                    {
+                        "item_id": get(row, "order_item_id"),
+                        "product_id": get(row, "product_id"),
+                        "seller_id": get(row, "seller_id"),
+                        "price": str(price),
+                        "freight": str(freight),
+                        "shipping_limit_at": get(row, "shipping_limit_date"),
+                    }
+                )
+            item_entities = EntityIds(
+                order_ids=(order_id,),
+                item_ids=tuple(str(line["item_id"]) for line in lines if line["item_id"]),
+                seller_ids=tuple(str(line["seller_id"]) for line in lines if line["seller_id"]),
+            )
+            entities = entities.union(item_entities)
+            used.append(items)
+            price_total = sum((Decimal(line["price"]) for line in lines), Decimal("0"))
+            freight_total = sum((Decimal(line["freight"]) for line in lines), Decimal("0"))
+            findings.append(
+                self._finding(
+                    task,
+                    "ORDER_ITEMS",
+                    {
+                        "lines": lines,
+                        "items_total": str(price_total),
+                        "freight_total": str(freight_total),
+                        "order_total": str(price_total + freight_total),
+                    },
+                    [items],
+                    item_entities,
+                )
+            )
         return self._result(task, context, findings, entities, gaps, used)
 
 
@@ -312,110 +305,103 @@ class PaymentAgent(_Specialist):
         gaps: list[str] = []
         used: list[EvidenceRecord] = []
         entities = EntityIds()
-        for order_id in self._order_ids(task):
-            payments = await self._fetch(context, gaps, "get_order_payments", order_id=order_id)
+        payload = self._payload(task)
+        anchor = purchase_anchor(payload.findings)
+        if anchor is None:
+            gaps.append("NO_PURCHASE_ANCHOR")
+        for order_id in payload.entity_ids.order_ids:
             timeline = await self._fetch(context, gaps, "get_payment_timeline", order_id=order_id)
-            refunds = await self._fetch(context, gaps, "get_refund_timeline", order_id=order_id)
-
-            base_rows: list[dict[str, Any]] = []
-            base_record = None
-            for record in (payments, timeline):
-                if record is None:
-                    continue
-                candidate = nested_rows(record.data, "payments", "base_payments") or rows(
-                    record.data
-                )
-                candidate = [
-                    r for r in candidate if get(r, "payment_value", "amount", "value") is not None
-                ]
-                if candidate:
-                    base_rows, base_record = candidate, record
-                    break
-            if base_record is not None:
-                refs: list[str] = []
-                total = Decimal("0")
-                summary = []
-                for row in base_rows:
-                    value = money(get(row, "payment_value", "amount", "value")) or Decimal("0")
-                    total += value
-                    ref = get(row, "payment_reference", "payment_id", "transaction_id")
-                    if ref:
-                        refs.append(str(ref))
-                    summary.append(
-                        {
-                            "payment_reference": None if ref is None else str(ref),
-                            "sequential": get(row, "payment_sequential", "sequence"),
-                            "type": get(row, "payment_type", "method"),
-                            "installments": get(row, "payment_installments", "installments"),
-                            "value": str(value),
-                            "status": lower(get(row, "status", "payment_status")) or None,
-                        }
-                    )
-                used.append(base_record)
-                pay_entities = EntityIds(order_ids=(order_id,), payment_references=tuple(refs))
-                entities = entities.union(pay_entities)
-                findings.append(
-                    self._finding(
-                        task,
-                        "PAYMENTS",
-                        {
-                            "count": len(base_rows),
-                            "total_paid": str(total),
-                            "rows": summary,
-                        },
-                        [base_record],
-                        pay_entities,
-                    )
-                )
-
             if timeline is not None:
-                events = nested_rows(timeline.data, "events", "lifecycle_events", "timeline")
-                if not events and timeline is not base_record:
-                    events = [
-                        r for r in rows(timeline.data) if get(r, "event_type", "event", "type")
-                    ]
-                if events:
-                    used.append(timeline)
-                    compact = [
-                        {
-                            "event": lower(get(e, "event_type", "event", "type", "status")),
-                            "amount": str(money(get(e, "amount", "value", "payment_value")) or ""),
-                            "payment_reference": get(
-                                e, "payment_reference", "payment_id", "transaction_id"
-                            ),
-                            "at": get(e, "occurred_at", "timestamp", "at", "created_at"),
-                        }
-                        for e in events
-                    ]
-                    findings.append(self._finding(task, "PAYMENT_EVENTS", compact, [timeline]))
-
-            if refunds is not None:
-                events = nested_rows(refunds.data, "events", "refunds", "lifecycle_events") or rows(
-                    refunds.data
-                )
-                events = [
-                    e
-                    for e in events
-                    if get(e, "status", "refund_status", "event_type", "event", "amount")
-                ]
-                used.append(refunds)
-                compact = [
-                    {
-                        "status": lower(get(e, "status", "refund_status", "event_type", "event")),
-                        "amount": str(money(get(e, "amount", "refund_amount", "value")) or ""),
-                        "refund_id": get(e, "refund_id", "refund_reference", "id"),
-                        "payment_reference": get(e, "payment_reference", "payment_id"),
-                        "at": get(e, "occurred_at", "timestamp", "at", "created_at"),
+                captures, other, dropped = [], [], 0
+                for event in distinct(nested_rows(timeline.data, "events")):
+                    kind = lower(get(event, "event_type"))
+                    at = when(get(event, "event_at"))
+                    window = CAPTURE_WINDOW if kind == "captured" else PAYMENT_EVENT_WINDOW
+                    if not within(at, anchor, window):
+                        dropped += 1
+                        continue
+                    compact = {
+                        "event": kind,
+                        "status": lower(get(event, "status")),
+                        "amount": str(money(get(event, "amount_brl", "amount")) or "0.00"),
+                        "at": get(event, "event_at"),
                     }
-                    for e in events
-                ]
-                # An empty refund timeline from a valid envelope is negative evidence.
-                findings.append(
-                    self._finding(
-                        task, "REFUND_EVENTS", compact, [refunds], EntityIds(order_ids=(order_id,))
+                    (captures if kind == "captured" else other).append(compact)
+                if dropped:
+                    gaps.append(f"get_payment_timeline:{dropped}_EVENTS_OUTSIDE_ORDER_TIMELINE")
+                captured = [c for c in captures if c["status"] in ("confirmed", "")]
+                amounts = [Decimal(c["amount"]) for c in captured]
+                base = nested_rows(timeline.data, "payments")
+                kept_rows = _match_payment_rows(base, amounts)
+                if captured or other:
+                    used.append(timeline)
+                    findings.append(
+                        self._finding(
+                            task,
+                            "PAYMENTS",
+                            {
+                                "captures": captured,
+                                "events": other,
+                                "total_captured": str(sum(amounts, Decimal("0"))),
+                                "rows": kept_rows,
+                                "anchored": anchor is not None,
+                            },
+                            [timeline],
+                            EntityIds(order_ids=(order_id,)),
+                        )
                     )
-                )
+                    entities = entities.union(EntityIds(order_ids=(order_id,)))
+            refunds = await self._fetch(context, gaps, "get_refund_timeline", order_id=order_id)
+            if refunds is not None:
+                kept, dropped = [], 0
+                for event in distinct(nested_rows(refunds.data, "events") or rows(refunds.data)):
+                    at = when(get(event, "event_at"))
+                    if get(event, "event_type", "status") is None:
+                        continue
+                    if not within(at, anchor, REFUND_WINDOW):
+                        dropped += 1
+                        continue
+                    kept.append(
+                        {
+                            "event": lower(get(event, "event_type")),
+                            "status": lower(get(event, "status")),
+                            "amount": str(money(get(event, "amount_brl", "amount")) or "0.00"),
+                            "at": get(event, "event_at"),
+                        }
+                    )
+                if dropped:
+                    gaps.append(f"get_refund_timeline:{dropped}_EVENTS_OUTSIDE_ORDER_TIMELINE")
+                if kept:
+                    used.append(refunds)
+                    findings.append(
+                        self._finding(
+                            task,
+                            "REFUNDS",
+                            kept,
+                            [refunds],
+                            EntityIds(order_ids=(order_id,)),
+                        )
+                    )
         return self._result(task, context, findings, entities, gaps, used)
+
+
+def _match_payment_rows(base: list[dict[str, Any]], amounts: list[Decimal]) -> list[dict[str, Any]]:
+    """Keep base payment rows whose value matches a relevant capture (multiset match)."""
+    remaining = list(amounts)
+    kept = []
+    for row in base:
+        value = money(get(row, "payment_value"))
+        if value in remaining:
+            remaining.remove(value)
+            kept.append(
+                {
+                    "sequential": get(row, "payment_sequential"),
+                    "type": get(row, "payment_type"),
+                    "installments": get(row, "payment_installments"),
+                    "value": str(value),
+                }
+            )
+    return kept
 
 
 # ------------------------------------------------------------- shipment agent
@@ -428,63 +414,56 @@ class ShipmentAgent(_Specialist):
         gaps: list[str] = []
         used: list[EvidenceRecord] = []
         entities = EntityIds()
-        for order_id in self._order_ids(task):
+        payload = self._payload(task)
+        anchor = purchase_anchor(payload.findings)
+        for order_id in payload.entity_ids.order_ids:
             record = await self._fetch(context, gaps, "get_shipment_summary", order_id=order_id)
-            if record is None:
+            if record is None or not rows(record.data):
                 continue
-            data = thaw(record.data)
-            base = data if isinstance(data, dict) else (rows(data)[0] if rows(data) else {})
-            delivered = when(
-                get(
-                    base, "order_delivered_customer_date", "delivered_customer_date", "delivered_at"
+            base = rows(record.data)[0]
+            delivered = when(get(base, "delivered_customer_at"))
+            estimated = when(get(base, "estimated_delivery_at"))
+            carrier = when(get(base, "delivered_carrier_at"))
+            limits = []
+            for row in nested_rows(record.data, "shipping_limits"):
+                limit = when(get(row, "shipping_limit_at"))
+                if within(limit, anchor, ITEM_LIMIT_WINDOW):
+                    limits.append(limit)
+            limit = max(limits) if limits else None
+            late_events, dropped = [], 0
+            for event in nested_rows(record.data, "events"):
+                at = when(get(event, "event_at"))
+                relevant = (
+                    delivered is not None
+                    and at is not None
+                    and abs(at - delivered) <= DELIVERY_EVENT_TOLERANCE
                 )
-            )
-            estimated = when(
-                get(
-                    base,
-                    "order_estimated_delivery_date",
-                    "estimated_delivery_date",
-                    "promised_date",
+                if not relevant:
+                    dropped += 1
+                    continue
+                late_events.append(
+                    {
+                        "event": lower(get(event, "event_type")),
+                        "actor": lower(get(event, "actor")),
+                        "status": lower(get(event, "status")),
+                        "at": get(event, "event_at"),
+                    }
                 )
-            )
-            carrier = when(
-                get(
-                    base,
-                    "order_delivered_carrier_date",
-                    "delivered_carrier_date",
-                    "carrier_handoff_at",
-                )
-            )
-            limits = [
-                when(get(r, "shipping_limit_date"))
-                for r in nested_rows(data, "items", "seller_handoff_limits", "handoff_limits")
-            ]
-            limit = when(get(base, "shipping_limit_date", "seller_handoff_limit")) or max(
-                (x for x in limits if x), default=None
-            )
-            shipment_ids = [str(x) for x in (get(base, "shipment_id", "tracking_id"),) if x]
-            events = nested_rows(data, "events", "shipment_events")
+            if dropped:
+                gaps.append(f"get_shipment_summary:{dropped}_EVENTS_OUTSIDE_DELIVERY")
+            late = bool(delivered and estimated and delivered > estimated)
             summary = {
-                "delivered_customer": delivered.isoformat() if delivered else None,
-                "estimated_delivery": estimated.isoformat() if estimated else None,
-                "delivered_carrier": carrier.isoformat() if carrier else None,
-                "seller_handoff_limit": limit.isoformat() if limit else None,
-                "delivered_late": bool(
-                    delivered and estimated and delivered.date() > estimated.date()
-                ),
-                "late_days": (delivered.date() - estimated.date()).days
-                if delivered and estimated
-                else None,
+                "status": lower(get(base, "order_status")) or None,
+                "delivered_customer_at": get(base, "delivered_customer_at"),
+                "estimated_delivery_at": get(base, "estimated_delivery_at"),
+                "delivered_carrier_at": get(base, "delivered_carrier_at"),
+                "delivered_late": late,
+                "late_days": (delivered - estimated).days if late else 0,
                 "seller_handoff_late": bool(carrier and limit and carrier > limit),
-                "event_count": len(events),
-                "flags": {k: v for k, v in base.items() if isinstance(v, bool)}
-                if isinstance(base, dict)
-                else {},
+                "events": late_events,
             }
             used.append(record)
-            ship_entities = EntityIds(order_ids=(order_id,), shipment_ids=tuple(shipment_ids))
+            ship_entities = EntityIds(order_ids=(order_id,))
             entities = entities.union(ship_entities)
-            findings.append(
-                self._finding(task, "SHIPMENT_SUMMARY", summary, [record], ship_entities)
-            )
+            findings.append(self._finding(task, "SHIPMENT", summary, [record], ship_entities))
         return self._result(task, context, findings, entities, gaps, used)

@@ -171,11 +171,9 @@ def analyze_intake(case: Mapping[str, Any]) -> CaseIntake:
         hints = [code for code, pattern in TEXT_HINTS if pattern.search(lowered)]
     hints = sorted(set(hints))
 
-    routes: set[str] = {ORDER_AGENT}
-    for hint in hints:
-        routes.update(TOPIC_ROUTES.get(hint, ()))
-    if len(routes) == 1:
-        routes.update((PAYMENT_AGENT, SHIPMENT_AGENT))
+    # Claims are unverified, so routing never narrows on them: every case checks all
+    # three domains (the label comes from evidence). Hints only travel as task focus.
+    routes: set[str] = {ORDER_AGENT, PAYMENT_AGENT, SHIPMENT_AGENT}
     ordered_routes = tuple(sorted(routes, key=PRIORITY.__getitem__))
     policy_version = case.get("policy_version")
     return CaseIntake(
@@ -288,6 +286,10 @@ class Coordinator:
             for target in intake.routes
         ]
         await self._investigate(state, trace, runtime, queue, attempt=0)
+        if not state.evidence:
+            # Transport/tool failures are not negative evidence; never finalize a case
+            # (or let a batch be packaged) when no evidence could be collected at all.
+            raise CaseFailedError(intake.case_id, "NO_EVIDENCE_COLLECTED", ",".join(state.gaps))
 
         revision = 0
         decision, candidate = await self._policy_and_candidate(state, trace, runtime, attempt=0)

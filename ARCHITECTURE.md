@@ -2,11 +2,27 @@
 
 Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
 
-**Trạng thái: đã triển khai baseline (rules `l3a-rules-v1`).** Module tương ứng:
+**Trạng thái: đã triển khai (rules `l3a-rules-v2`).** Module tương ứng:
 `a2a.py` (message contract), `coordinator.py` (intake, routing, budget, handoff,
 validate result, candidate, remediation), `agents.py` (order/payment/shipment),
 `policy.py`, `verifier.py`, `ledger.py` (Evidence Ledger + allowlist tool),
-`mcp_gateway.py` (MCP streamable HTTP có deadline/retry), `workflow.py`.
+`mcp_gateway.py` (MCP streamable HTTP có deadline/retry), `competition.py`
+(mở run), `workflow.py`.
+
+Phát hiện từ MCP evidence thật (quyết định rules v2):
+
+- MCP chỉ trả evidence khi team có run đang mở; `day09 run` gọi `POST /api/v2/runs`
+  (giống workspace) trước khi chạy, và ref chỉ hợp lệ trong run đó.
+- Evidence của một order có thể lẫn dòng thuộc cửa sổ thời gian khác. Specialist neo
+  theo `order_purchase_timestamp`: capture trong [-1h, +1d], item có
+  `shipping_limit_date` trong [0, +6d], refund trong [0, +25d], event giao trễ trùng
+  ngày giao thực tế (±1d). Dòng trùng lặp hoàn toàn được loại.
+- Nhãn chọn theo thứ tự: canceled/unavailable có tiền đã capture → refund failed →
+  refund pending → `reconciliation_mismatch` → capture trùng → giao trễ (theo `actor`)
+  → split khớp tổng đơn → `unsupported_claim`. `case_status`, action và loại bên chịu
+  trách nhiệm lấy từ `get_policy` (EC_POLICY_V1); `party_id` seller lấy từ item.
+- Case không thu được evidence nào bị đánh `failed` (không ghi output), để batch
+  không bao giờ được đóng gói với toàn output rỗng evidence.
 
 Điểm lệch có chủ đích so với đặc tả gốc bên dưới:
 

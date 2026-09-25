@@ -1,11 +1,13 @@
-"""Policy agent: deterministic rules over evidence-backed findings.
+"""Policy agent: classify the primary issue from evidence-backed findings, then apply
+the machine-readable policy returned by ``get_policy`` (status, action, parties).
 
-RULES_VERSION identifies the rule/rounding/confidence set used in a run. The rules
-only read findings that carry evidence refs; claim topics are hypotheses to test.
+RULES_VERSION identifies the rule/rounding/confidence set used in a run. Claim topics
+are hypotheses only; they never decide the label.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -21,18 +23,95 @@ from .a2a import (
     SupportLink,
 )
 from .agents import money
-from .ledger import EvidenceRecord
+from .ledger import EvidenceRecord, thaw
 from .mcp_gateway import GatewayError, GatewayFatalError
 
-RULES_VERSION = "l3a-rules-v1"
+RULES_VERSION = "l3a-rules-v2"
 CENT = Decimal("0.01")
+ZERO = Decimal("0")
 
-CANCELED_STATUSES = {"canceled", "cancelled"}
-UNAVAILABLE_STATUSES = {"unavailable"}
-REFUND_DONE = {"completed", "succeeded", "success", "refunded", "processed", "done"}
-REFUND_PENDING = {"pending", "requested", "processing", "in_progress", "created", "initiated"}
-REFUND_FAILED = {"failed", "rejected", "declined", "error", "reversed"}
-CHARGE_EVENTS = {"captured", "charged", "charge", "capture", "settled", "paid", "payment_captured"}
+# Fallback when get_policy is unavailable; mirrors the EC_POLICY_V1 rule shape.
+DEFAULT_RULES: dict[str, dict[str, Any]] = {
+    "canceled_order_paid": {
+        "case_status": "action_required",
+        "recommended_action": "issue_refund",
+        "responsible_parties": [{"party_type": "platform", "party_id": None}],
+    },
+    "unavailable_order_paid": {
+        "case_status": "action_required",
+        "recommended_action": "issue_refund",
+        "responsible_parties": [{"party_type": "seller", "party_id": "SELLER"}],
+    },
+    "late_delivery_seller": {
+        "case_status": "action_required",
+        "recommended_action": "refund_freight",
+        "responsible_parties": [{"party_type": "seller", "party_id": "SELLER"}],
+    },
+    "late_delivery_logistics": {
+        "case_status": "action_required",
+        "recommended_action": "refund_freight",
+        "responsible_parties": [{"party_type": "logistics_provider", "party_id": None}],
+    },
+    "valid_split_payment": {
+        "case_status": "no_action",
+        "recommended_action": "document_no_action",
+        "responsible_parties": [{"party_type": "customer", "party_id": None}],
+    },
+    "payment_mismatch": {
+        "case_status": "action_required",
+        "recommended_action": "reconcile_payment",
+        "responsible_parties": [{"party_type": "payment_provider", "party_id": None}],
+    },
+    "duplicate_charge": {
+        "case_status": "action_required",
+        "recommended_action": "refund_duplicate_charge",
+        "responsible_parties": [{"party_type": "payment_provider", "party_id": None}],
+    },
+    "refund_pending": {
+        "case_status": "needs_investigation",
+        "recommended_action": "monitor_refund",
+        "responsible_parties": [{"party_type": "payment_provider", "party_id": None}],
+    },
+    "refund_failed": {
+        "case_status": "action_required",
+        "recommended_action": "retry_refund",
+        "responsible_parties": [{"party_type": "payment_provider", "party_id": None}],
+    },
+    "unsupported_claim": {
+        "case_status": "no_action",
+        "recommended_action": "document_no_action",
+        "responsible_parties": [{"party_type": "customer", "party_id": None}],
+    },
+    "insufficient_evidence": {
+        "case_status": "needs_investigation",
+        "recommended_action": "request_more_evidence",
+        "responsible_parties": [{"party_type": "unknown", "party_id": None}],
+    },
+}
+
+CAUSE_CODES = {
+    "canceled_order_paid": "ORDER_CANCELED_AFTER_PAYMENT",
+    "unavailable_order_paid": "ITEM_UNAVAILABLE_AFTER_PAYMENT",
+    "late_delivery_seller": "SELLER_LATE_HANDOFF",
+    "late_delivery_logistics": "CARRIER_DELIVERY_DELAY",
+    "valid_split_payment": "SPLIT_PAYMENT_MATCHES_ORDER_TOTAL",
+    "payment_mismatch": "PAYMENT_RECONCILIATION_MISMATCH",
+    "duplicate_charge": "DUPLICATE_PAYMENT_CAPTURE",
+    "refund_pending": "REFUND_IN_PROGRESS",
+    "refund_failed": "REFUND_PROCESSING_FAILED",
+    "unsupported_claim": "NO_DISCREPANCY_IN_EVIDENCE",
+    "insufficient_evidence": "EVIDENCE_UNAVAILABLE",
+}
+
+REFUND_REASON = {
+    "canceled_order_paid": "CANCELED_ORDER_REFUND",
+    "unavailable_order_paid": "UNAVAILABLE_ORDER_REFUND",
+    "late_delivery_seller": "LATE_DELIVERY_FREIGHT_REFUND",
+    "late_delivery_logistics": "LATE_DELIVERY_FREIGHT_REFUND",
+    "payment_mismatch": "PAYMENT_MISMATCH_RECONCILIATION",
+    "duplicate_charge": "DUPLICATE_CHARGE_REFUND",
+    "refund_failed": "FAILED_REFUND_RETRY",
+}
 
 
 def _round(value: Decimal) -> Decimal:
@@ -63,6 +142,7 @@ class PolicyAgent:
                 "task_id": task.task_id,
                 "attempt": task.attempt,
                 "rules_version": RULES_VERSION,
+                "policy_version": payload.policy_version,
                 "primary_issue": decision.assessment["primary_issue"],
                 "case_status": decision.assessment["case_status"],
             },
@@ -89,218 +169,153 @@ class PolicyAgent:
             return None
 
 
-def _by_code(findings: tuple[Finding, ...], code: str) -> list[Finding]:
-    return [f for f in findings if f.finding_code == code]
+@dataclass
+class _Facts:
+    status: Finding | None = None
+    items: Finding | None = None
+    payments: Finding | None = None
+    refunds: Finding | None = None
+    shipment: Finding | None = None
+    sellers: list[str] = field(default_factory=list)
+    order_id: str | None = None
+
+    @classmethod
+    def of(cls, findings: tuple[Finding, ...]) -> _Facts:
+        facts = cls()
+        for finding in findings:
+            attr = {
+                "ORDER_STATUS": "status",
+                "ORDER_ITEMS": "items",
+                "PAYMENTS": "payments",
+                "REFUNDS": "refunds",
+                "SHIPMENT": "shipment",
+            }.get(finding.finding_code)
+            if attr and getattr(facts, attr) is None:
+                setattr(facts, attr, finding)
+        if facts.items:
+            facts.sellers = sorted(
+                {line["seller_id"] for line in facts.items.value["lines"] if line.get("seller_id")}
+            )
+        if facts.status:
+            facts.order_id = facts.status.value.get("order_id")
+        return facts
+
+
+def classify(facts: _Facts) -> tuple[str, Decimal, list[Finding], float]:
+    """Return (primary_issue, refund amount, supporting findings, confidence)."""
+    status = facts.status.value.get("status") if facts.status else None
+    captures = facts.payments.value["captures"] if facts.payments else []
+    pay_events = facts.payments.value["events"] if facts.payments else []
+    paid = sum((Decimal(c["amount"]) for c in captures), ZERO)
+    order_total = money(facts.items.value["order_total"]) if facts.items else None
+    freight = money(facts.items.value["freight_total"]) if facts.items else None
+    refunds = facts.refunds.value if facts.refunds else []
+    shipment = facts.shipment.value if facts.shipment else None
+    anchored = bool(facts.payments and facts.payments.value.get("anchored"))
+    base_conf = 0.9 if anchored else 0.7
+
+    def found(*items: Finding | None) -> list[Finding]:
+        return [item for item in items if item is not None]
+
+    if status in ("canceled", "unavailable") and paid > 0:
+        issue = "canceled_order_paid" if status == "canceled" else "unavailable_order_paid"
+        already = sum(
+            (Decimal(r["amount"]) for r in refunds if r["status"] in ("completed", "succeeded")),
+            ZERO,
+        )
+        return (
+            issue,
+            max(ZERO, paid - already),
+            found(facts.status, facts.payments, facts.items, facts.refunds),
+            base_conf,
+        )
+    failed = [r for r in refunds if r["status"] == "failed"]
+    if failed:
+        amount = sum((Decimal(r["amount"]) for r in failed), ZERO)
+        return "refund_failed", amount, found(facts.refunds, facts.payments), base_conf
+    pending = [r for r in refunds if r["status"] in ("pending", "processing", "requested")]
+    if pending:
+        return "refund_pending", ZERO, found(facts.refunds, facts.payments), base_conf
+    mismatch = [e for e in pay_events if "mismatch" in e["event"]]
+    if mismatch:
+        amount = sum((Decimal(e["amount"]) for e in mismatch), ZERO)
+        return "payment_mismatch", amount, found(facts.payments, facts.items), base_conf
+    amounts = [Decimal(c["amount"]) for c in captures]
+    duplicates = ZERO
+    for value in set(amounts):
+        if amounts.count(value) > 1:
+            duplicates += value * (amounts.count(value) - 1)
+    if duplicates > 0 and (order_total is None or paid - order_total > CENT):
+        return "duplicate_charge", duplicates, found(facts.payments, facts.items), base_conf
+    if shipment and (
+        shipment["delivered_late"]
+        or any(e["event"] == "delivered_late" for e in shipment["events"])
+    ):
+        actors = {e["actor"] for e in shipment["events"] if e["event"] == "delivered_late"}
+        if "seller" in actors or (not actors and shipment["seller_handoff_late"]):
+            issue = "late_delivery_seller"
+        else:
+            issue = "late_delivery_logistics"
+        # Refund the freight actually paid: never more than freight or than captured.
+        amount = freight or ZERO
+        if paid > 0:
+            amount = min(amount, paid) if amount > 0 else paid
+        return issue, amount, found(facts.shipment, facts.items, facts.payments), base_conf - 0.05
+    if len(captures) > 1 and order_total is not None and abs(paid - order_total) <= CENT:
+        return "valid_split_payment", ZERO, found(facts.payments, facts.items), base_conf
+    if facts.status and (facts.payments or facts.shipment):
+        return "unsupported_claim", ZERO, found(facts.status, facts.payments, facts.shipment), 0.75
+    return "insufficient_evidence", ZERO, found(facts.status, facts.payments), 0.6
+
+
+def _rules(policy: EvidenceRecord | None) -> dict[str, dict[str, Any]]:
+    if policy is None:
+        return DEFAULT_RULES
+    data = thaw(policy.data)
+    rules = data.get("rules") if isinstance(data, dict) else None
+    if not isinstance(rules, dict):
+        return DEFAULT_RULES
+    return {**DEFAULT_RULES, **rules}
 
 
 def decide(payload: PolicyTaskPayload, policy: EvidenceRecord | None) -> tuple[PolicyDecision, str]:
-    findings = payload.findings
-    status_f = _by_code(findings, "ORDER_STATUS")
-    items_f = _by_code(findings, "ORDER_ITEMS")
-    pay_f = _by_code(findings, "PAYMENTS")
-    events_f = _by_code(findings, "PAYMENT_EVENTS")
-    refund_f = _by_code(findings, "REFUND_EVENTS")
-    ship_f = _by_code(findings, "SHIPMENT_SUMMARY")
+    facts = _Facts.of(payload.findings)
+    issue, amount, used, confidence = classify(facts)
+    rule = _rules(policy)[issue]
+    status = rule.get("case_status", DEFAULT_RULES[issue]["case_status"])
+    action = rule.get("recommended_action")
 
-    order_status = status_f[0].value if status_f else None
-    paid = money(pay_f[0].value.get("total_paid")) if pay_f else None
-    order_total = money(items_f[0].value.get("order_total")) if items_f else None
-    refunds = refund_f[0].value if refund_f else None
-    shipment = ship_f[0].value if ship_f else None
-    item_lines = items_f[0].value.get("lines", []) if items_f else []
-    sellers = sorted({line["seller_id"] for line in item_lines if line.get("seller_id")})
-    order_id = next(iter(payload.affected_entities.order_ids), None)
-
-    refunded = Decimal("0")
-    pending = Decimal("0")
-    failed = Decimal("0")
-    refund_states: set[str] = set()
-    for event in refunds or []:
-        state = event.get("status") or ""
-        amount = money(event.get("amount")) or Decimal("0")
-        refund_states.add(state)
-        if state in REFUND_DONE:
-            refunded += amount
-        elif state in REFUND_PENDING:
-            pending += amount
-        elif state in REFUND_FAILED:
-            failed += amount
-
-    charges: list[tuple[str, Decimal]] = []
-    for event in events_f[0].value if events_f else []:
-        if event.get("event") in CHARGE_EVENTS and money(event.get("amount")):
-            charges.append((str(event.get("payment_reference") or ""), money(event["amount"])))
-    duplicate_amount = Decimal("0")
-    seen: dict[Decimal, int] = {}
-    for _, amount in charges:
-        seen[amount] = seen.get(amount, 0) + 1
-    for amount, count in seen.items():
-        if count > 1:
-            duplicate_amount += amount * (count - 1)
-    if not duplicate_amount and pay_f:
-        rows = pay_f[0].value.get("rows", [])
-        statuses = {r.get("status") for r in rows}
-        values = [money(r.get("value")) for r in rows]
-        if len(rows) > 1 and "duplicate" in statuses:
-            duplicate_amount = sum(
-                (
-                    v
-                    for r, v in zip(rows, values, strict=False)
-                    if r.get("status") == "duplicate" and v
-                ),
-                Decimal("0"),
-            )
-
-    used: list[Finding] = []
-    issue = "insufficient_evidence"
-    status = "needs_investigation"
-    causes: list[str] = []
-    parties: list[dict[str, Any]] = []
-    refund_lines: list[dict[str, Any]] = []
-    actions: list[str] = []
-    confidence = 0.55
-    decision_code = "INSUFFICIENT_EVIDENCE"
-    remaining = None
-    if paid is not None:
-        remaining = max(Decimal("0"), paid - refunded - pending)
-
-    if order_status in CANCELED_STATUSES | UNAVAILABLE_STATUSES and paid and paid > 0:
-        issue = (
-            "canceled_order_paid" if order_status in CANCELED_STATUSES else "unavailable_order_paid"
-        )
-        used += status_f + pay_f + refund_f
-        if pending > 0 and remaining == 0:
-            issue, status = "refund_pending", "needs_investigation"
-            causes, actions = ["REFUND_IN_PROGRESS"], ["monitor_pending_refund"]
-            parties = [{"party_type": "payment_provider", "party_id": None}]
-        elif remaining and remaining > 0:
-            status = "action_required"
-            causes = [
-                "ORDER_CANCELED_AFTER_PAYMENT"
-                if issue == "canceled_order_paid"
-                else "ITEM_UNAVAILABLE_AFTER_PAYMENT"
-            ]
-            parties = (
-                [{"party_type": "seller", "party_id": s} for s in sellers]
-                if issue == "unavailable_order_paid" and sellers
-                else [{"party_type": "platform", "party_id": None}]
-            )
-            refund_lines = [
-                {
-                    "reason_code": issue.upper(),
-                    "amount_brl": _round(remaining),
-                    "entity_id": order_id,
-                }
-            ]
-            actions = ["issue_full_refund" if refunded == 0 else "refund_remaining_balance"]
-        else:
-            status = "no_action"
-            causes = ["REFUND_ALREADY_COMPLETED"]
-            parties = [{"party_type": "platform", "party_id": None}]
-        confidence = 0.85
-        decision_code = "REFUND_FOR_UNFULFILLED_ORDER"
-    elif refund_states & REFUND_FAILED and failed > 0:
-        issue, status = "refund_failed", "action_required"
-        used += refund_f + pay_f
-        causes = ["REFUND_FAILED"]
-        parties = [{"party_type": "payment_provider", "party_id": None}]
-        refund_lines = [
-            {"reason_code": "REFUND_RETRY", "amount_brl": _round(failed), "entity_id": order_id}
-        ]
-        actions = ["retry_failed_refund"]
-        confidence = 0.8
-        decision_code = "REFUND_FAILED"
-    elif refund_states & REFUND_PENDING and pending > 0:
-        issue, status = "refund_pending", "needs_investigation"
-        used += refund_f + pay_f
-        causes = ["REFUND_IN_PROGRESS"]
-        parties = [{"party_type": "payment_provider", "party_id": None}]
-        actions = ["monitor_pending_refund"]
-        confidence = 0.8
-        decision_code = "REFUND_PENDING"
-    elif duplicate_amount > 0:
-        issue, status = "duplicate_charge", "action_required"
-        used += pay_f + events_f + refund_f
-        causes = ["DUPLICATE_CAPTURE"]
-        parties = [{"party_type": "payment_provider", "party_id": None}]
-        refund_lines = [
-            {
-                "reason_code": "DUPLICATE_CHARGE",
-                "amount_brl": _round(duplicate_amount),
-                "entity_id": order_id,
-            }
-        ]
-        actions = ["refund_duplicate_charge"]
-        confidence = 0.8
-        decision_code = "DUPLICATE_CHARGE"
-    elif paid is not None and order_total is not None and abs(paid - order_total) > CENT:
-        issue = "payment_mismatch"
-        used += pay_f + items_f
-        causes = ["PAYMENT_AMOUNT_MISMATCH"]
-        parties = [{"party_type": "payment_provider", "party_id": None}]
-        if paid > order_total:
-            status = "action_required"
-            refund_lines = [
-                {
-                    "reason_code": "OVERCHARGE",
-                    "amount_brl": _round(paid - order_total),
-                    "entity_id": order_id,
-                }
-            ]
-            actions = ["refund_overcharge"]
-        else:
-            status = "needs_investigation"
-            actions = ["review_payment_records"]
-        confidence = 0.7
-        decision_code = "PAYMENT_MISMATCH"
-    elif shipment and shipment.get("delivered_late"):
-        used += ship_f + items_f
-        if shipment.get("seller_handoff_late"):
-            issue = "late_delivery_seller"
-            causes = ["SELLER_LATE_HANDOFF"]
-            parties = [{"party_type": "seller", "party_id": s} for s in sellers] or [
+    parties = []
+    for party in rule.get("responsible_parties") or DEFAULT_RULES[issue]["responsible_parties"]:
+        party_type = party.get("party_type", "unknown")
+        if party_type == "seller":
+            parties += [{"party_type": "seller", "party_id": s} for s in facts.sellers] or [
                 {"party_type": "seller", "party_id": None}
             ]
         else:
-            issue = "late_delivery_logistics"
-            causes = ["CARRIER_TRANSIT_DELAY"]
-            parties = [{"party_type": "logistics_provider", "party_id": None}]
-        status = "action_required"
-        actions = ["compensate_late_delivery"]
-        confidence = 0.75
-        decision_code = "LATE_DELIVERY"
-    elif (
-        pay_f
-        and len(pay_f[0].value.get("rows", [])) > 1
-        and paid is not None
-        and (order_total is None or abs(paid - order_total) <= CENT)
-    ):
-        issue, status = "valid_split_payment", "no_action"
-        used += pay_f + items_f
-        causes = ["SPLIT_PAYMENT_MATCHES_ORDER"]
-        confidence = 0.75
-        decision_code = "VALID_SPLIT_PAYMENT"
-    elif status_f and (pay_f or ship_f):
-        issue, status = "unsupported_claim", "no_action"
-        used += status_f + pay_f + ship_f + refund_f
-        causes = ["NO_DISCREPANCY_FOUND"]
-        confidence = 0.6
-        decision_code = "CLAIM_NOT_SUPPORTED"
-    else:
-        used += status_f + pay_f
-        actions = ["request_manual_review"]
-        confidence = 0.6 if payload.coverage_gaps else 0.5
+            parties.append({"party_type": party_type, "party_id": None})
+
+    refund = _round(amount) if status == "action_required" else ZERO
+    refund_lines = []
+    if refund > 0:
+        refund_lines.append(
+            {
+                "reason_code": REFUND_REASON.get(issue, issue.upper()),
+                "amount_brl": refund,
+                "entity_id": facts.order_id,
+            }
+        )
+    actions = [action] if action else []
+    if payload.conflicts:
+        confidence = min(confidence, 0.7)
 
     refs = list(dict.fromkeys(ref for f in used for ref in f.evidence_refs))
     if policy is not None and refs:
         refs.append(policy.evidence_ref)
-    total_refund = sum((line["amount_brl"] for line in refund_lines), Decimal("0"))
-    if payload.conflicts:
-        confidence = min(confidence, 0.6)
 
     claim_assessments = []
     for claim in payload.claims:
-        verdict, claim_conf = _claim_verdict(claim.text, issue, total_refund, paid, bool(refs))
+        verdict, claim_conf = _claim_verdict(claim.text, issue, action, refund)
         claim_assessments.append(
             {
                 "claim_id": claim.claim_id[:64],
@@ -311,21 +326,22 @@ def decide(payload: PolicyTaskPayload, policy: EvidenceRecord | None) -> tuple[P
         )
 
     decision = PolicyDecision(
-        assessment={"primary_issue": issue, "case_status": status, "confidence": confidence},
+        assessment={
+            "primary_issue": issue,
+            "case_status": status,
+            "confidence": round(confidence, 2),
+        },
         root_cause_analysis={
-            "ranked_causes": [{"cause_code": c, "rank": i} for i, c in enumerate(causes, start=1)],
+            "ranked_causes": [{"cause_code": CAUSE_CODES[issue], "rank": 1}],
             "responsible_parties": _unique_parties(parties),
         },
         financial_resolution={
             "currency": "BRL",
-            "recommended_refund_brl": _round(total_refund),
+            "recommended_refund_brl": refund,
             "refund_lines": refund_lines,
         },
         resolution_actions=tuple(actions),
-        data_conflicts=tuple(
-            DataConflict(c.field, c.sources, c.selected_source, c.resolution_code)
-            for c in payload.conflicts[:5]
-        ),
+        data_conflicts=tuple(payload.conflicts[:5]),
         evidence_refs=tuple(refs[:30]),
         support_links=(
             SupportLink(
@@ -334,23 +350,23 @@ def decide(payload: PolicyTaskPayload, policy: EvidenceRecord | None) -> tuple[P
         ),
         claim_assessments=tuple(claim_assessments),
     )
-    return decision, decision_code
+    return decision, issue.upper()
 
 
 def _claim_verdict(
-    topic: str, issue: str, refund: Decimal, paid: Decimal | None, has_evidence: bool
+    topic: str, issue: str, action: str | None, refund: Decimal
 ) -> tuple[str, float]:
-    if not has_evidence or issue == "insufficient_evidence":
+    if issue == "insufficient_evidence":
         return "insufficient_evidence", 0.6
     if topic == "requested_full_refund":
-        if refund > 0 and paid is not None and refund >= paid:
-            return "supported", 0.8
+        if refund > 0 and action == "issue_refund":
+            return "supported", 0.85
         if refund > 0:
-            return "partially_supported", 0.7
-        return "unsupported", 0.7
+            return "partially_supported", 0.75
+        return "unsupported", 0.8
     if topic == issue:
-        return "supported", 0.8
-    return "unsupported", 0.7
+        return "supported", 0.9
+    return "unsupported", 0.85
 
 
 def _unique_parties(parties: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -361,3 +377,6 @@ def _unique_parties(parties: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key)
             result.append(party)
     return result[:5]
+
+
+__all__ = ["RULES_VERSION", "DataConflict", "PolicyAgent", "decide"]
