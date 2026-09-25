@@ -9,10 +9,13 @@ from pathlib import Path
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
+from .coordinator import CaseFailedError
+from .ledger import check_tool_mapping
 from .mcp_gateway import connect_gateway
+from .policy import RULES_VERSION
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
-from .workflow import solve_case
+from .workflow import LOCAL_RUN_ID, solve_case
 
 
 def _root(value: str) -> Path:
@@ -40,14 +43,23 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
+    failed: dict[str, str] = {}
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        problems = check_tool_mapping(await gateway.discover())
+        if problems:
+            raise RuntimeError("MCP tool mapping mismatch: " + "; ".join(problems))
+        for index, case_id in enumerate(case_set.case_ids, start=1):
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
+            try:
+                output = await solve_case(case, gateway, trace)
+            except CaseFailedError as exc:
+                failed[case_id] = exc.reason_code
+                print(f"[{index}/{len(case_set.case_ids)}] {case_id} FAILED {exc}", file=sys.stderr)
+                continue
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
@@ -58,6 +70,27 @@ async def _run(root: Path) -> None:
             )
             temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            assessment = output["assessment"]
+            print(
+                f"[{index}/{len(case_set.case_ids)}] {case_id} {assessment['primary_issue']}"
+                f" / {assessment['case_status']} / refs={len(output['evidence_refs'])}",
+                flush=True,
+            )
+        stats = gateway.stats
+    report = {
+        "local_run_id": LOCAL_RUN_ID,
+        "rules_version": RULES_VERSION,
+        "cases": len(case_set.case_ids),
+        "finalized": len(case_set.case_ids) - len(failed),
+        "failed": failed,
+        "mcp_requests": stats["requests"],
+        "mcp_retries": stats["retries"],
+    }
+    # Local run report, outside the submission ZIP (traces/ only ships trace.jsonl).
+    (root / "traces" / "run-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps(report))
+    if failed:
+        raise RuntimeError(f"batch incomplete: {len(failed)} case(s) failed; do not package")
 
 
 def parser() -> argparse.ArgumentParser:
